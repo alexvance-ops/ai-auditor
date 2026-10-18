@@ -1,10 +1,21 @@
 import os
-import time
-import asyncio
+import zipfile
+import tempfile
+import re
 from fastapi import FastAPI, BackgroundTasks, HTTPException, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import List, Union
 
 app = FastAPI(title="Ultra-Secure Multi-Chat AI Auditor & Voice Alert System")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 ACTIVE_SESSIONS = {}
 
@@ -14,21 +25,20 @@ class AuditRequest(BaseModel):
     language: str = "python"
     voice_lang: str = "bn"
 
-def deep_security_audit_engine(chat_id: str, code_snippet: str, voice_lang: str):
-    ACTIVE_SESSIONS[chat_id] = {"status": "Processing", "progress": "10%"}
-    print(f"[Core Engine] Audit initiated for Chat ID: {chat_id}")
-    time.sleep(3)
-    ACTIVE_SESSIONS[chat_id] = {"status": "Analyzing Vulnerabilities", "progress": "50%"}
-    time.sleep(4)
-    voice_msg = "Audit complete! No critical vulnerabilities detected."
-    ACTIVE_SESSIONS[chat_id] = {
-        "status": "Completed",
-        "progress": "100%",
-        "vulnerabilities_found": 0,
-        "security_score": "98/100",
-        "voice_alert": voice_msg
-    }
-    print(f"[Core Engine] Audit complete & Voice alert ready for Chat ID: {chat_id}")
+class VulnerabilityDetail(BaseModel):
+    file_name: str
+    line_number: int
+    severity: str
+    issue: str
+    code_snippet: str
+    recommendation: str
+
+class AuditResponse(BaseModel):
+    filename: str
+    status: str
+    security_score: str
+    critical_bugs_found: int
+    vulnerabilities: List[VulnerabilityDetail]
 
 @app.get("/")
 def check_status():
@@ -38,49 +48,70 @@ def check_status():
         "max_parallel_chats": 5
     }
 
-@app.post("/audit/start")
-async def start_deep_audit(request: AuditRequest, background_tasks: BackgroundTasks):
-    if len(ACTIVE_SESSIONS) >= 5 and request.chat_id not in ACTIVE_SESSIONS:
-        raise HTTPException(status_code=429, detail="Maximum 5 active chat sessions limit reached.")
-    background_tasks.add_task(
-        deep_security_audit_engine,
-        request.chat_id,
-        request.code_snippet,
-        request.voice_lang
-    )
-    return {
-        "status": "Initiated",
-        "chat_id": request.chat_id,
-        "message": f"Deep audit started in background for session {request.chat_id}."
-    }
-
-@app.get("/audit/status/{chat_id}")
-def get_audit_status(chat_id: str):
-    if chat_id not in ACTIVE_SESSIONS:
-        return {"status": "Not Found", "message": "No active session with this ID"}
-    return ACTIVE_SESSIONS[chat_id]
-
-@app.post("/audit/upload")
+@app.post("/audit/upload", response_model=AuditResponse)
 async def audit_file(file: UploadFile = File(...)):
     content = await file.read()
-    code_text = content.decode("utf-8", errors="ignore")
-    
-    # অটোমেটিক বাগ ও ভালনারেবিলিটি ভ্যালিডেশন লজিক
-    vulnerabilities = []
-    
-    if "eval(" in code_text or "exec(" in code_text:
-        vulnerabilities.append("CRITICAL: Dynamic Code Execution Found (Remote Code Execution Risk)")
-    if "SELECT" in code_text and "+" in code_text:
-        vulnerabilities.append("HIGH: Potential SQL Injection Vulnerability Detected")
-    if "secret_key" in code_text.lower() or "password" in code_text.lower():
-        vulnerabilities.append("MEDIUM: Hardcoded Secrets/Credentials Found")
-        
-    security_score = max(0, 100 - (len(vulnerabilities) * 25))
-    
-    return {
-        "filename": file.filename,
-        "status": "Audit & False-Positive Verification Completed",
-        "security_score": f"{security_score}/100",
-        "critical_bugs_found": len(vulnerabilities),
-        "vulnerability_report": vulnerabilities if vulnerabilities else "No critical bugs detected after verification!"
-    }
+    vulnerabilities_found = []
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_file_path = os.path.join(temp_dir, file.filename)
+        with open(temp_file_path, "wb") as f:
+            f.write(content)
+
+        files_to_scan = []
+
+        if file.filename.endswith('.zip'):
+            try:
+                with zipfile.ZipFile(temp_file_path, 'r') as zip_ref:
+                    zip_ref.extractall(temp_dir)
+                for root, _, files in os.walk(temp_dir):
+                    for f_name in files:
+                        if f_name.endswith(('.py', '.js', '.json', '.txt', '.env', '.ts', '.html')):
+                            files_to_scan.append(os.path.join(root, f_name))
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"ZIP File extraction failed: {str(e)}")
+        else:
+            files_to_scan.append(temp_file_path)
+
+        for filepath in files_to_scan:
+            rel_path = os.path.relpath(filepath, temp_dir)
+            try:
+                with open(filepath, 'r', encoding='utf-8', errors='ignore') as code_file:
+                    for line_num, line in enumerate(code_file, start=1):
+                        line_str = line.strip()
+                        
+                        # 1. Check for hardcoded secrets
+                        if ("secret_key" in line_str.lower() or "password" in line_str.lower() or "api_key" in line_str.lower()) and "=" in line_str:
+                            if not any(ignore in line_str.lower() for ignore in ["example", "placeholder", "your_"]):
+                                vulnerabilities_found.append(VulnerabilityDetail(
+                                    file_name=rel_path,
+                                    line_number=line_num,
+                                    severity="MEDIUM",
+                                    issue="Hardcoded Secrets/Credentials Found",
+                                    code_snippet=line_str[:80],
+                                    recommendation="Use Environment Variables (.env) instead of hardcoding credentials."
+                                ))
+
+                        # 2. Check for Dangerous Execution
+                        elif "eval(" in line_str or "exec(" in line_str:
+                            vulnerabilities_found.append(VulnerabilityDetail(
+                                file_name=rel_path,
+                                line_number=line_num,
+                                severity="CRITICAL",
+                                issue="Dynamic Code Execution Risk",
+                                code_snippet=line_str[:80],
+                                recommendation="Avoid eval()/exec() to prevent Remote Code Execution (RCE)."
+                            ))
+
+            except Exception:
+                continue
+
+    score = max(0, 100 - (len(vulnerabilities_found) * 25))
+
+    return AuditResponse(
+        filename=file.filename,
+        status="Audit & False-Positive Verification Completed",
+        security_score=f"{score}/100",
+        critical_bugs_found=len(vulnerabilities_found),
+        vulnerabilities=vulnerabilities_found
+    )
