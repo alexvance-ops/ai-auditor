@@ -1,7 +1,7 @@
 import os
 import time
 import asyncio
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException, File, UploadFile
 from pydantic import BaseModel
 
 app = FastAPI(title="Ultra-Secure Multi-Chat AI Auditor & Voice Alert System")
@@ -64,3 +64,13 @@ def get_audit_status(chat_id: str):
     if chat_id not in ACTIVE_SESSIONS:
         return {"status": "Not Found", "message": "No active session with this ID"}
     return ACTIVE_SESSIONS[chat_id]
+
+@app.post("/audit/upload")
+async def audit_file(file: UploadFile = File(...)):
+    content = await file.read()
+    code_text = content.decode("utf-8")
+    return {
+        "filename": file.filename,
+        "status": "File received successfully",
+        "code_length": len(code_text)
+    }
