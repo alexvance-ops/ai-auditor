@@ -1,608 +1,273 @@
-"""
-OMEGA Protocol Auditor — FastAPI Upgrade Scaffold
 
-Evidence-based, language-aware static source-code security triage.
-
-Install:
-    pip install fastapi uvicorn python-multipart pydantic
-
-Run:
-    uvicorn app:app --host 127.0.0.1 --port 8000
-
-Security notes:
-    - Uploaded code is read as text and never executed.
-    - Production deployments should add authentication, rate limits,
-      upload limits, and retention controls.
-    - Findings are investigation leads, not proof of vulnerabilities.
-"""
-
-from __future__ import annotations
-
+import ast
 import hashlib
 import io
 import re
 import zipfile
-from pathlib import PurePosixPath
-from typing import Any
+from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-
-# ============================================================
-# Application configuration
-# ============================================================
+APP_VERSION = "5.0.0"
+MAX_UPLOAD = 5 * 1024 * 1024
+MAX_FILES = 300
 
 app = FastAPI(
-    title="OMEGA Protocol Auditor",
-    version="4.0.0",
-    description=(
-        "Evidence-first static triage scaffold "
-        "for authorized source-code reviews."
-    ),
+    title="OMEGA AI Security Auditor",
+    version=APP_VERSION,
+    description="Evidence-first security analysis for authorized code reviews."
 )
 
-MAX_UPLOAD_BYTES = 15 * 1024 * 1024
-MAX_FILES = 500
-MAX_FILE_BYTES = 2 * 1024 * 1024
-
-ALLOWED_SINGLE_EXTS = {
-    ".sol",
-    ".rs",
-    ".py",
-    ".js",
-    ".jsx",
-    ".ts",
-    ".tsx",
-    ".php",
-    ".go",
-    ".java",
-    ".kt",
-    ".vy",
-    ".json",
-    ".toml",
-    ".yaml",
-    ".yml",
+EXTENSIONS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".php",
+    ".java", ".go", ".rb", ".json", ".yaml", ".yml"
 }
 
-EXCLUDED_PARTS = {
-    ".git",
-    "node_modules",
-    ".yarn",
-    "vendor",
-    "lib",
-    "out",
-    "cache",
-    "artifacts",
-    "broadcast",
-    "target",
-    "dist",
-    "build",
-    "__pycache__",
-}
-
-
-# ============================================================
-# Response models
-# ============================================================
-
-class Finding(BaseModel):
-    rule_id: str
-    title: str
-    status: str = "INVESTIGATION_LEAD"
-    severity_hint: str = "LOW"
-    confidence: str = "LOW"
-    file: str
-    line: int
-    evidence: str
-    why_it_matters: str
-    validation_needed: list[str] = Field(default_factory=list)
-
-
-class AuditResult(BaseModel):
-    filename: str
-    sha256: str
-    status: str
-    security_score: int
-    score_note: str
-    files_processed: int
-    lines_inspected: int
-    findings_count: int
-    confirmed_vulnerabilities: int
-    findings: list[Finding]
-    limitations: list[str]
-
-
-class TextAuditRequest(BaseModel):
-    filename: str = "snippet.sol"
-    code: str = Field(min_length=1, max_length=500_000)
-
-
-# ============================================================
-# Security scanning rules
-# ============================================================
-
-RULES: list[dict[str, Any]] = [
+RULES = [
     {
-        "id": "SOL_DELEGATECALL",
-        "ext": {".sol"},
-        "regex": r"\bdelegatecall\s*\(",
-        "title": "Delegatecall requires context and target review",
-        "severity": "MEDIUM",
-        "why": (
-            "Delegatecall executes code in the caller's storage context. "
-            "Risk depends on target control, authorization, and design."
-        ),
-        "validate": [
-            "Trace whether the target is attacker-controlled or changeable.",
-            "Review storage layout and authorization.",
-            "Build a local test only if a concrete unsafe path is found.",
-        ],
-    },
-    {
-        "id": "SOL_LOW_LEVEL_CALL",
-        "ext": {".sol"},
-        "regex": r"\.(?:call|staticcall|delegatecall)\s*(?:\{|\()",
-        "title": "Low-level call requires control-flow review",
-        "severity": "LOW",
-        "why": (
-            "Low-level calls can fail, re-enter, or call unexpected targets. "
-            "The syntax alone is not a vulnerability."
-        ),
-        "validate": [
-            "Check target and calldata control.",
-            "Check return values and failure handling.",
-            "Trace state updates before and after the call.",
-        ],
-    },
-    {
-        "id": "SOL_TX_ORIGIN",
-        "ext": {".sol"},
-        "regex": r"\btx\.origin\b",
-        "title": "tx.origin usage",
-        "severity": "MEDIUM",
-        "why": (
-            "Using tx.origin for authorization can enable phishing-style "
-            "authorization bypasses, but not every use is unsafe."
-        ),
-        "validate": [
-            "Determine whether it gates a privileged action.",
-            "Trace caller-controlled paths and alternative checks.",
-        ],
-    },
-    {
-        "id": "SOL_SELFDESTRUCT",
-        "ext": {".sol"},
-        "regex": r"\bselfdestruct\s*\(",
-        "title": "Self-destruct semantics and authorization",
-        "severity": "MEDIUM",
-        "why": (
-            "Impact depends on compiler/EVM version, reachability, "
-            "and access control."
-        ),
-        "validate": [
-            "Confirm compiler and EVM target.",
-            "Trace who can reach this operation and its actual impact.",
-        ],
-    },
-    {
-        "id": "SOL_ECRECOVER",
-        "ext": {".sol"},
-        "regex": r"\becrecover\s*\(",
-        "title": "Signature verification review",
-        "severity": "LOW",
-        "why": (
-            "Signature recovery should be checked for domain separation, "
-            "replay protection, signer authorization, and malformed signatures."
-        ),
-        "validate": [
-            "Trace nonce/deadline and chain/domain binding.",
-            "Check signer authorization and signature malleability protections.",
-        ],
-    },
-    {
-        "id": "SOL_ASSEMBLY",
-        "ext": {".sol", ".vy"},
-        "regex": r"\bassembly\b",
-        "title": "Assembly block needs manual review",
-        "severity": "INFO",
-        "why": (
-            "Assembly bypasses some high-level language safeguards. "
-            "Its presence alone is not a bug."
-        ),
-        "validate": [
-            "Review memory and storage assumptions.",
-            "Check bounds, return-data handling, and call semantics.",
-        ],
-    },
-    {
-        "id": "RUST_UNSAFE",
-        "ext": {".rs"},
-        "regex": r"\bunsafe\b",
-        "title": "Rust unsafe block/function review",
-        "severity": "INFO",
-        "why": (
-            "Unsafe Rust requires checking safety invariants. "
-            "The keyword alone does not establish memory unsafety."
-        ),
-        "validate": [
-            "Identify the invariant required by each unsafe operation.",
-            "Check pointer validity, aliasing, lifetime, and bounds assumptions.",
-        ],
-    },
-    {
-        "id": "RUST_RAW_POINTER",
-        "ext": {".rs"},
-        "regex": r"\b(?:\*const|\*mut)\s+[A-Za-z_]",
-        "title": "Rust raw pointer use",
-        "severity": "INFO",
-        "why": (
-            "Raw pointers require careful validity and aliasing reasoning. "
-            "Their declaration alone is not a vulnerability."
-        ),
-        "validate": [
-            "Trace pointer provenance and lifetime.",
-            "Inspect dereferences and bounds checks.",
-        ],
-    },
-    {
-        "id": "PY_DYNAMIC_EXEC",
+        "id": "PY001",
+        "title": "Dynamic code execution",
+        "severity": "HIGH",
         "ext": {".py"},
-        "regex": r"\b(?:eval|exec)\s*\(",
-        "title": "Dynamic code execution sink",
-        "severity": "MEDIUM",
-        "why": (
-            "Dynamic execution can be dangerous if untrusted input "
-            "reaches the execution sink."
-        ),
-        "validate": [
-            "Trace input sources to the sink.",
-            "Determine whether input is attacker-controlled and safely constrained.",
-        ],
+        "pattern": r"\b(eval|exec)\s*\(",
+        "why": "Dynamic execution may become code injection with untrusted input.",
+        "fix": "Avoid eval/exec; parse input with a strict schema."
     },
     {
-        "id": "PY_COMMAND_EXEC",
+        "id": "PY002",
+        "title": "Possible SQL injection",
+        "severity": "HIGH",
         "ext": {".py"},
-        "regex": r"\b(?:os\.system|subprocess\.(?:run|Popen|call))\s*\(",
-        "title": "Operating-system command execution",
-        "severity": "LOW",
-        "why": (
-            "Command execution needs review for shell use "
-            "and untrusted argument flow."
-        ),
-        "validate": [
-            "Trace untrusted inputs.",
-            "Check shell=True and argument-array usage.",
-            "Verify allowlisting and escaping.",
-        ],
+        "pattern": r"""(?i)execute\s*\(\s*(f["']|["'][^"']*%s)""",
+        "why": "SQL string construction may allow untrusted data into a query.",
+        "fix": "Use parameterized queries."
     },
     {
-        "id": "JS_HTML_SINK",
-        "ext": {".js", ".jsx", ".ts", ".tsx"},
-        "regex": r"\b(?:innerHTML|outerHTML|dangerouslySetInnerHTML)\b",
-        "title": "HTML injection-sensitive sink",
-        "severity": "LOW",
-        "why": (
-            "HTML sinks can cause XSS if attacker-controlled content "
-            "is inserted without context-appropriate sanitization."
-        ),
-        "validate": [
-            "Trace source-to-sink data flow.",
-            "Check framework escaping and sanitizer configuration.",
-        ],
+        "id": "JS001",
+        "title": "Potential unsafe HTML insertion",
+        "severity": "MEDIUM",
+        "ext": {".js", ".ts", ".jsx", ".tsx"},
+        "pattern": r"\.innerHTML\s*=",
+        "why": "Untrusted HTML may create cross-site scripting risk.",
+        "fix": "Prefer textContent or framework-safe escaping."
     },
     {
-        "id": "GEN_SECRET_LITERAL",
-        "ext": ALLOWED_SINGLE_EXTS,
-        "regex": (
-            r"""(?i)\b(?:api[_-]?key|secret|password|private[_-]?key|"""
-            r"""access[_-]?token)\b\s*[:=]\s*['"][^'"]{8,}['"]"""
-        ),
+        "id": "SEC001",
         "title": "Possible hard-coded secret",
-        "severity": "MEDIUM",
-        "why": (
-            "A string literal may contain a credential. "
-            "Evidence is redacted to avoid leaking secrets in reports."
-        ),
-        "validate": [
-            "Inspect locally without sharing the secret.",
-            (
-                "If real, rotate it and move it to a secret manager "
-                "or environment variable."
-            ),
-        ],
-        "redact": True,
+        "severity": "HIGH",
+        "ext": EXTENSIONS,
+        "pattern": r"""(?i)\b(api_key|api-key|password|client_secret|access_token)\b\s*[:=]\s*["'][^"']{8,}["']""",
+        "why": "Credentials in source code may leak through version control.",
+        "fix": "Use environment variables or a secret manager; rotate exposed secrets."
     },
+    {
+        "id": "PY003",
+        "title": "Process execution requires review",
+        "severity": "MEDIUM",
+        "ext": {".py"},
+        "pattern": r"\bsubprocess\.(run|Popen|call|check_output)\s*\(",
+        "why": "Process execution is risky when arguments contain untrusted data.",
+        "fix": "Use argument lists, avoid shell=True, and validate input."
+    },
+    {
+        "id": "PHP001",
+        "title": "PHP deserialization requires review",
+        "severity": "HIGH",
+        "ext": {".php"},
+        "pattern": r"\bunserialize\s*\(",
+        "why": "Deserializing untrusted data may introduce object injection.",
+        "fix": "Avoid deserializing untrusted input."
+    }
 ]
 
+class AuditRequest(BaseModel):
+    filename: str = "snippet.py"
+    code: str = Field(min_length=1, max_length=300_000)
 
-# ============================================================
-# Source-code scanning helpers
-# ============================================================
+def analyze(filename: str, code: str) -> list:
+    ext = Path(filename).suffix.lower()
+    findings = []
 
-def _is_comment_or_blank(line: str, ext: str) -> bool:
-    """Check whether a line is blank or appears to be a comment."""
-    stripped = line.strip()
-
-    if not stripped:
-        return True
-
-    if ext in {".py", ".yml", ".yaml", ".toml"}:
-        if stripped.startswith("#"):
-            return True
-
-    comment_extensions = {
-        ".sol",
-        ".rs",
-        ".js",
-        ".jsx",
-        ".ts",
-        ".tsx",
-        ".go",
-        ".java",
-        ".kt",
-        ".php",
-        ".vy",
-    }
-
-    if ext in comment_extensions:
-        if (
-            stripped.startswith("//")
-            or stripped.startswith("/*")
-            or stripped.startswith("*")
-        ):
-            return True
-
-    return False
-
-
-def _scan_text(path: str, content: str) -> tuple[list[Finding], int]:
-    """Scan source text and return investigation leads and line count."""
-    ext = PurePosixPath(path).suffix.lower()
-    lines = content.splitlines()
-    findings: list[Finding] = []
-
-    for line_number, line in enumerate(lines, start=1):
-        if _is_comment_or_blank(line, ext):
-            continue
-
+    for number, line in enumerate(code.splitlines(), 1):
         for rule in RULES:
             if ext not in rule["ext"]:
                 continue
 
-            if not re.search(rule["regex"], line):
-                continue
+            if re.search(rule["pattern"], line):
+                findings.append({
+                    "rule_id": rule["id"],
+                    "title": rule["title"],
+                    "severity": rule["severity"],
+                    "confidence": "LOW",
+                    "file": Path(filename).name,
+                    "line": number,
+                    "evidence": line.strip()[:250],
+                    "why_it_matters": rule["why"],
+                    "recommendation": rule["fix"],
+                    "validation_required": True
+                })
 
-            if rule.get("redact"):
-                evidence = "[REDACTED: possible secret literal]"
-            else:
-                evidence = line.strip()[:350]
+    # Python syntax errors are useful findings too.
+    if ext == ".py":
+        try:
+            ast.parse(code)
+        except SyntaxError as exc:
+            findings.append({
+                "rule_id": "PY-SYNTAX",
+                "title": "Python syntax error",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "file": Path(filename).name,
+                "line": exc.lineno or 1,
+                "evidence": (exc.msg or "Syntax error")[:250],
+                "why_it_matters": "Invalid syntax can prevent the program from running.",
+                "recommendation": "Fix the reported syntax error and rerun tests.",
+                "validation_required": True
+            })
 
-            findings.append(
-                Finding(
-                    rule_id=rule["id"],
-                    title=rule["title"],
-                    status="INVESTIGATION_LEAD",
-                    severity_hint=rule["severity"],
-                    confidence="LOW",
-                    file=path,
-                    line=line_number,
-                    evidence=evidence,
-                    why_it_matters=rule["why"],
-                    validation_needed=rule["validate"],
-                )
-            )
+    return findings
 
-    return findings, len(lines)
-
-
-# ============================================================
-# Safe ZIP source extraction
-# ============================================================
-
-def _safe_zip_sources(data: bytes) -> list[tuple[str, str]]:
-    """Extract supported text files from a ZIP archive."""
-    sources: list[tuple[str, str]] = []
-
-    try:
-        with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            infos = archive.infolist()
-
-            if len(infos) > MAX_FILES:
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"Archive has too many entries (max {MAX_FILES}).",
-                )
-
-            for info in infos:
-                path = PurePosixPath(info.filename)
-
-                if info.is_dir():
-                    continue
-
-                if path.is_absolute() or ".." in path.parts:
-                    continue
-
-                if any(
-                    part in EXCLUDED_PARTS or part.startswith(".")
-                    for part in path.parts
-                ):
-                    continue
-
-                if path.suffix.lower() not in ALLOWED_SINGLE_EXTS:
-                    continue
-
-                if info.file_size > MAX_FILE_BYTES or info.file_size == 0:
-                    continue
-
-                with archive.open(info) as source_file:
-                    raw = source_file.read(MAX_FILE_BYTES + 1)
-
-                if len(raw) > MAX_FILE_BYTES:
-                    continue
-
-                sources.append(
-                    (
-                        str(path),
-                        raw.decode("utf-8", errors="replace"),
-                    )
-                )
-
-    except zipfile.BadZipFile as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid ZIP archive.",
-        ) from exc
-
-    return sources
-
-
-# ============================================================
-# Audit result generation
-# ============================================================
-
-def _make_result(
-    filename: str,
-    sha: str,
-    sources: list[tuple[str, str]],
-) -> AuditResult:
-    """Scan sources and assemble the final audit response."""
-    findings: list[Finding] = []
-    total_lines = 0
-
-    for path, content in sources:
-        matches, line_count = _scan_text(path, content)
-        findings.extend(matches)
-        total_lines += line_count
-
-    # This is a triage index, not a security guarantee or probability.
-    # Absence of pattern matches does not prove that a repository is safe.
-    score = max(0, 100 - min(100, len(findings) * 3))
-
-    return AuditResult(
-        filename=filename,
-        sha256=sha,
-        status="TRIAGE_COMPLETE_REVIEW_REQUIRED",
-        security_score=score,
-        score_note=(
-            "Heuristic triage index only; not a probability, certification, "
-            "or proof of safety. Lower scores mean more pattern leads were found."
-        ),
-        files_processed=len(sources),
-        lines_inspected=total_lines,
-        findings_count=len(findings),
-        confirmed_vulnerabilities=0,
-        findings=findings,
-        limitations=[
-            "No finding is confirmed by pattern matching alone.",
-            "This version does not compile or execute uploaded code.",
-            "No complete semantic call graph, symbolic execution, or fuzzing is performed.",
-            "No findings does not mean the code is secure.",
-            "Only selected file types and configured rules are inspected.",
-        ],
-    )
-
-
-# ============================================================
-# API routes
-# ============================================================
-
-@app.get("/")
-async def root():
-    """Return basic service information."""
+def make_report(filename, code, findings):
     return {
-        "name": "OMEGA Protocol Auditor",
-        "version": app.version,
-        "mode": "read-only static triage",
-        "routes": [
-            "/audit/upload",
-            "/audit/text",
-            "/health",
-        ],
-        "warning": (
-            "Findings are investigation leads, "
-            "not confirmed vulnerabilities."
-        ),
+        "service": "OMEGA AI Security Auditor",
+        "version": APP_VERSION,
+        "filename": Path(filename).name,
+        "sha256": hashlib.sha256(code.encode()).hexdigest(),
+        "status": "REVIEW_REQUIRED" if findings else "NO_MATCHING_RULES",
+        "files_processed": 1,
+        "lines_inspected": len(code.splitlines()),
+        "findings_count": len(findings),
+        "confirmed_vulnerabilities": 0,
+        "findings": findings,
+        "limitations": [
+            "Pattern-based analysis only.",
+            "Findings may be false positives.",
+            "No findings does not prove the code is secure.",
+            "Manual review and additional tests are necessary."
+        ]
     }
 
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+    <!doctype html>
+    <html lang="en">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>OMEGA Security Auditor</title>
+    <style>
+    body{font:16px system-ui;background:#101522;color:#eef2ff;
+    max-width:850px;margin:30px auto;padding:16px}
+    textarea,input,button{box-sizing:border-box;width:100%;padding:12px;
+    margin:8px 0;border-radius:8px}
+    textarea,input{background:#202a3b;color:white;border:1px solid #526078}
+    button{background:#4285f4;color:white;border:0;font-weight:bold}
+    a{color:#8cb8ff}
+    </style>
+    <h1>OMEGA Security Auditor</h1>
+    <p>Analyze source code you own or are authorized to review.</p>
+    <form id="audit">
+      <input id="filename" value="sample.py" aria-label="Filename">
+      <textarea id="code" rows="12" required
+        placeholder="Paste source code here"></textarea>
+      <button>Analyze Code</button>
+    </form>
+    <p><a href="/docs">Open API documentation</a></p>
+    <pre id="result">Ready.</pre>
+    <script>
+    document.getElementById('audit').onsubmit = async function(e) {
+      e.preventDefault();
+      const out = document.getElementById('result');
+      out.textContent = 'Analyzing...';
+      try {
+        const r = await fetch('/audit/text', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({
+            filename:document.getElementById('filename').value,
+            code:document.getElementById('code').value
+          })
+        });
+        const data = await r.json();
+        out.textContent = JSON.stringify(data, null, 2);
+      } catch (_) {
+        out.textContent = 'Request failed. Check server status.';
+      }
+    };
+    </script>
+    </html>
+    """
 
 @app.get("/health")
-async def health():
-    """Return service health information."""
-    return {
-        "ok": True,
-        "version": app.version,
-    }
+def health():
+    return {"status": "healthy", "version": APP_VERSION}
 
+@app.post("/audit/text")
+def audit_text(req: AuditRequest):
+    findings = analyze(req.filename, req.code)
+    return make_report(req.filename, req.code, findings)
 
-@app.post("/audit/upload", response_model=AuditResult)
-async def audit_upload(file: UploadFile = File(...)):
-    """Audit an uploaded source file or ZIP archive."""
-    filename = file.filename or "uploaded-source"
-    lower_filename = filename.lower()
+@app.post("/audit/file")
+async def audit_file(file: UploadFile = File(...)):
+    name = Path(file.filename or "upload.txt").name
+    raw = await file.read(MAX_UPLOAD + 1)
 
-    raw = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(raw) > MAX_UPLOAD:
+        raise HTTPException(413, "Maximum upload size is 5 MiB.")
 
-    if len(raw) > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail="Upload too large (maximum 15 MiB).",
-        )
+    if Path(name).suffix.lower() != ".zip":
+        if Path(name).suffix.lower() not in EXTENSIONS:
+            raise HTTPException(400, "Unsupported source file type.")
+        try:
+            code = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(400, "File must be UTF-8 text.")
+        result = make_report(name, code, analyze(name, code))
+        result["sha256"] = hashlib.sha256(raw).hexdigest()
+        return result
 
-    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            entries = archive.infolist()
+            if len(entries) > MAX_FILES:
+                raise HTTPException(413, "Too many ZIP entries.")
 
-    if lower_filename.endswith(".zip"):
-        sources = _safe_zip_sources(raw)
+            findings = []
+            processed = 0
+            total_lines = 0
+            total_size = 0
 
-        if not sources:
-            raise HTTPException(
-                status_code=400,
-                detail="No supported source files found in ZIP.",
-            )
+            for item in entries:
+                path = Path(item.filename)
+                if item.is_dir() or path.is_absolute() or ".." in path.parts:
+                    continue
+                if path.suffix.lower() not in EXTENSIONS:
+                    continue
+                if item.file_size > 500_000:
+                    continue
 
-    else:
-        extension = PurePosixPath(filename).suffix.lower()
+                total_size += item.file_size
+                if total_size > 15 * 1024 * 1024:
+                    raise HTTPException(413, "Uncompressed source limit exceeded.")
 
-        if extension not in ALLOWED_SINGLE_EXTS:
-            raise HTTPException(
-                status_code=400,
-                detail="Unsupported file type.",
-            )
+                source = archive.read(item).decode("utf-8", errors="replace")
+                findings.extend(analyze(item.filename, source))
+                processed += 1
+                total_lines += len(source.splitlines())
 
-        safe_filename = PurePosixPath(filename).name
-
-        sources = [
-            (
-                safe_filename,
-                raw.decode("utf-8", errors="replace"),
-            )
-        ]
-
-    return _make_result(filename, digest, sources)
-
-
-@app.post("/audit/text", response_model=AuditResult)
-async def audit_text(request: TextAuditRequest):
-    """Audit a source-code snippet submitted as text."""
-    extension = PurePosixPath(request.filename).suffix.lower()
-
-    if extension not in ALLOWED_SINGLE_EXTS:
-        raise HTTPException(
-            status_code=400,
-            detail="Unsupported file extension.",
-        )
-
-    filename = PurePosixPath(request.filename).name
-    raw = request.code.encode("utf-8")
-    digest = hashlib.sha256(raw).hexdigest()
-
-    return _make_result(
-        filename,
-        digest,
-        [
-            (
-                filename,
-                request.code,
-            )
-        ],
-    )
+        return {
+            "filename": name,
+            "status": "REVIEW_REQUIRED" if findings else "NO_MATCHING_RULES",
+            "files_processed": processed,
+            "lines_inspected": total_lines,
+            "findings_count": len(findings),
+            "confirmed_vulnerabilities": 0,
+            "findings": findings,
+            "limitations": [
+                "Heuristic static analysis only.",
+                "No matching rules does not prove security."
+            ]
+        }
+    except zipfile.BadZipFile:
+        raise HTTPException(400, "Invalid ZIP archive.")
